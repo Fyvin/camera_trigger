@@ -1,0 +1,946 @@
+#!/usr/bin/env python3
+"""
+Aidlux平台相机监控脚本
+使用GStreamer流方式
+"""
+
+import subprocess
+import threading
+import time
+import os
+import glob
+import logging
+from datetime import datetime
+import gi
+import numpy as np
+import cv2
+from concurrent.futures import ThreadPoolExecutor
+
+# 设置Wayland环境变量
+os.environ["WAYLAND_DISPLAY"] = "wayland-1"
+os.environ["XDG_RUNTIME_DIR"] = "/run/user/root"
+
+# 导入GStreamer相关模块
+gi.require_version('Gst', '1.0')
+gi.require_version('GstVideo', '1.0')
+from gi.repository import Gst, GLib, GObject
+
+# 初始化GStreamer
+Gst.init(None)
+
+# 配置参数
+class Config:
+    # 图片保存目录
+    IMAGE_DIR = "/data/data/vendor/sunnyiot/pictures"
+    
+    # Aidlux GPIO路径
+    # GPIO_DIR = "/sys/aidlux/io_in1"
+    GPIO_MAP = {
+        0: "/sys/aidlux/io_in0/value",
+        1: "/sys/aidlux/io_in1/value",
+        2: "/sys/aidlux/io_in2/value",
+    }
+    
+    # LED控制路径
+    LED_BRIGHTNESS_PATH = "/sys/class/leds/long_led/brightness"
+    
+    # 上传服务器
+    UPLOAD_URL = "http://192.168.1.113:8000/upload"
+    
+    # 清理配置
+    CLEANUP_INTERVAL = 60
+    FILE_MAX_AGE = 60
+    
+    # GPIO检测间隔
+    GPIO_CHECK_INTERVAL = 0.01
+    
+    # LED定时器配置
+    LED_ON_DURATION = 0.3  # LED点亮持续时间：500ms
+    
+    # 上传配置
+    UPLOAD_TIMEOUT = 3
+    MAX_UPLOAD_WORKERS = 2
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler('/tmp/camera_monitor.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class GStreamerCamera:
+    """GStreamer相机流管理器"""
+    def __init__(self, camera_id=1):
+        self.camera_id = camera_id
+        self.pipeline = None
+        self.appsink = None
+        self.running = False
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
+        self.capture_requested = threading.Event()
+        self.captured_frame = None
+        self.capture_lock = threading.Lock()
+        self.frame_count = 0
+        
+    def build_pipeline(self) -> bool:
+        """构建GStreamer管道"""
+        try:
+            #--------- 2 ==================================
+            if self.camera_id == 0:
+                display = "width=1152 height=648 x=384 y=0"
+            elif self.camera_id == 1:
+                display = "width=768 height=432 x=0 y=648"
+            elif self.camera_id == 2:
+                display = "width=768 height=432 x=1152 y=648"
+            else:
+                display = ""
+            # --------- 2 ==================================
+            # 使用parse_launch构建管道
+            pipeline_str = f"""
+                qtiqmmfsrc camera={self.camera_id} name=camsrc !
+                video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 !
+                tee name=t
+                
+                t. ! queue ! videoconvert ! waylandsink {display}
+                
+                t. ! queue ! videorate ! video/x-raw,framerate=30/1 ! videoconvert !
+                video/x-raw,format=BGRx !
+                appsink name=mysink emit-signals=true sync=false async=false max-buffers=1 drop=true
+            """
+            # --------- 2 ==================================
+            self.pipeline = Gst.parse_launch(pipeline_str)
+            
+            if not self.pipeline:
+                logger.error("无法解析管道")
+                return False
+                
+            # 获取appsink元素
+            self.appsink = self.pipeline.get_by_name("mysink")
+            if not self.appsink:
+                logger.error("无法获取appsink元素")
+                return False
+                
+            # 连接新样本信号
+            self.appsink.connect("new-sample", self.on_new_sample)
+            
+            logger.info(f"摄像头{self.camera_id} GStreamer管道构建成功")
+            return True
+            
+        except Exception as e:
+            logger.error(f"构建管道失败: {str(e)}")
+            return False
+    
+    def on_new_sample(self, sink) -> Gst.FlowReturn:
+        """处理新的视频帧样本"""
+        try:
+            sample = sink.emit("pull-sample")
+            if not sample:
+                return Gst.FlowReturn.ERROR
+            
+            buffer = sample.get_buffer()
+            caps = sample.get_caps()
+            
+            if not caps:
+                return Gst.FlowReturn.ERROR
+            
+            structure = caps.get_structure(0)
+            width = structure.get_value("width")
+            height = structure.get_value("height")
+            
+            success, map_info = buffer.map(Gst.MapFlags.READ)
+            if not success:
+                return Gst.FlowReturn.ERROR
+            
+            try:
+                # 创建numpy数组 (BGRx格式)
+                frame = np.ndarray(
+                    shape=(height, width, 4),
+                    dtype=np.uint8,
+                    buffer=map_info.data
+                )
+                
+                # 转换为BGR格式
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                
+                # 更新最新帧
+                with self.frame_lock:
+                    self.latest_frame = frame_bgr
+                    self.frame_count += 1
+                
+                # 如果请求捕获，保存当前帧
+                if self.capture_requested.is_set():
+                    with self.capture_lock:
+                        self.captured_frame = frame_bgr.copy()
+                    self.capture_requested.clear()
+                    logger.debug("捕获一帧")
+                    
+            except Exception as e:
+                logger.debug(f"处理帧时出错: {e}")
+            finally:
+                buffer.unmap(map_info)
+            
+            return Gst.FlowReturn.OK
+            
+        except Exception as e:
+            logger.debug(f"on_new_sample出错: {e}")
+            return Gst.FlowReturn.ERROR
+    
+    def setup_bus_handler(self):
+        """设置总线消息处理器"""
+        if not self.pipeline:
+            return
+        
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self.on_bus_message)
+    
+    def on_bus_message(self, bus, message):
+        """处理总线消息回调"""
+        mtype = message.type
+        
+        if mtype == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            logger.error(f"[摄像头{self.camera_id}] GStreamer错误: {err}")
+            self.running = False
+    
+    def capture_image(self):
+        """请求捕获一张图片"""
+        # 设置捕获请求标志
+        self.capture_requested.set()
+        
+        # 等待捕获完成（最多等待500ms）
+        start_time = time.time()
+        while time.time() - start_time < 0.5:
+            if not self.capture_requested.is_set():
+                with self.capture_lock:
+                    if self.captured_frame is not None:
+                        frame = self.captured_frame.copy()
+                        self.captured_frame = None
+                        logger.info("成功捕获一帧")
+                        return frame
+            time.sleep(0.01)
+        
+        # 如果超时，尝试获取最新帧
+        with self.frame_lock:
+            if self.latest_frame is not None:
+                logger.info("使用最新帧")
+                return self.latest_frame.copy()
+        
+        logger.warning("未能捕获到图片帧")
+        return None
+    
+    def start(self):
+        """启动GStreamer管道"""
+        if not self.build_pipeline():
+            return False
+        
+        # 设置总线消息处理
+        self.setup_bus_handler()
+        
+        # 启动管道
+        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            logger.error(f"[摄像头{self.camera_id}] 无法启动管道")
+            return False
+        
+        # 等待管道状态变为播放
+        self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+        
+        self.running = True
+        logger.info(f"[摄像头{self.camera_id}] GStreamer管道已启动")
+        return True
+    
+    def stop(self):
+        """停止GStreamer管道"""
+        self.running = False
+        
+        if self.pipeline:
+            self.pipeline.set_state(Gst.State.NULL)
+            logger.info(f"[摄像头{self.camera_id}] GStreamer管道已停止")
+
+class AsyncUploadManager:
+    """异步上传管理器"""
+    def __init__(self, max_workers=2):
+        self.executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.upload_tasks = {}
+        self.upload_lock = threading.Lock()
+        self.task_callbacks = {}
+    
+    def upload_image_async(self, image_path, callback=None):
+        """异步上传图片"""
+        if not image_path or not os.path.exists(image_path):
+            logger.error(f"图片文件不存在: {image_path}")
+            return False
+        
+        task_id = os.path.basename(image_path)
+        
+        with self.upload_lock:
+            if task_id in self.upload_tasks:
+                logger.debug(f"上传任务已存在: {task_id}")
+                return False
+        
+        future = self.executor.submit(self._upload_image_task, image_path)
+        self.upload_tasks[task_id] = future
+        
+        if callback:
+            self.task_callbacks[task_id] = callback
+        
+        future.add_done_callback(lambda f: self._handle_upload_completion(f, task_id))
+        
+        logger.info(f"已提交异步上传任务: {task_id}")
+        return True
+    
+    def _upload_image_task(self, image_path):
+        """实际上传任务"""
+        filename = os.path.basename(image_path)
+        
+        try:
+            curl_command = [
+                "curl",
+                "--max-time", str(Config.UPLOAD_TIMEOUT),
+                "--connect-timeout", "2",
+                "-X", "POST",
+                "-F", f"files=@{image_path}",
+                Config.UPLOAD_URL
+            ]
+            
+            logger.debug(f"执行上传命令: {' '.join(curl_command)}")
+            
+            result = subprocess.run(
+                curl_command,
+                capture_output=True,
+                text=True,
+                timeout=Config.UPLOAD_TIMEOUT + 1
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"图片上传成功: {filename}")
+                return {"success": True, "filename": filename, "message": "上传成功"}
+            else:
+                logger.warning(f"图片上传失败: {filename}, 返回码: {result.returncode}")
+                return {"success": False, "filename": filename, "message": f"上传失败: {result.returncode}"}
+                
+        except subprocess.TimeoutExpired:
+            logger.warning(f"上传超时: {filename} (超过{Config.UPLOAD_TIMEOUT}秒)")
+            return {"success": False, "filename": filename, "message": "上传超时"}
+        except Exception as e:
+            logger.error(f"上传异常: {filename}, 错误: {str(e)}")
+            return {"success": False, "filename": filename, "message": f"上传异常: {str(e)}"}
+    
+    def _handle_upload_completion(self, future, task_id):
+        """处理上传任务完成"""
+        try:
+            result = future.result(timeout=0.1)
+            
+            with self.upload_lock:
+                if task_id in self.task_callbacks:
+                    callback = self.task_callbacks[task_id]
+                    try:
+                        callback(result, task_id)
+                    except Exception as e:
+                        logger.error(f"上传回调执行失败: {task_id}, 错误: {e}")
+                    finally:
+                        del self.task_callbacks[task_id]
+                
+                if task_id in self.upload_tasks:
+                    del self.upload_tasks[task_id]
+            
+            if not result.get("success", False):
+                logger.debug(f"上传任务完成但失败: {task_id} - {result.get('message', '未知错误')}")
+                
+        except Exception as e:
+            logger.error(f"处理上传完成异常: {task_id}, 错误: {e}")
+            with self.upload_lock:
+                if task_id in self.task_callbacks:
+                    del self.task_callbacks[task_id]
+                if task_id in self.upload_tasks:
+                    del self.upload_tasks[task_id]
+    
+    def shutdown(self):
+        """关闭上传管理器"""
+        self.executor.shutdown(wait=False)
+        logger.info("上传管理器已关闭")
+
+class LedTimerManager:
+    """LED定时器管理器"""
+    def __init__(self, led_control_func):
+        """
+        初始化LED定时器管理器
+        
+        Args:
+            led_control_func: LED控制函数，接受亮度值参数
+        """
+        self.led_control_func = led_control_func
+        self.led_timer = None
+        self.led_timer_lock = threading.Lock()
+        self.led_state = 0  # 0: 关闭, 1: 点亮
+        self.led_start_time = 0
+        
+    def turn_on_with_timer(self, duration=Config.LED_ON_DURATION):
+        """
+        点亮LED并设置定时器关闭
+        
+        Args:
+            duration: LED保持点亮的时间（秒）
+        """
+        with self.led_timer_lock:
+            current_time = time.time()
+            
+            # 1. 点亮LED（如果还没点亮）
+            if self.led_state == 0:
+                if self.led_control_func(255):
+                    self.led_state = 1
+                    self.led_start_time = current_time
+                    logger.info(f"LED点亮成功，设置{duration*1000}ms后关闭")
+                else:
+                    logger.error("LED点亮失败")
+                    return False
+            else:
+                # LED已经点亮，更新开始时间
+                self.led_start_time = current_time
+                logger.info(f"LED已点亮，重新计时{duration*1000}ms")
+            
+            # 2. 重置LED关闭定时器
+            self._reset_timer(duration)
+            return True
+    
+    def _reset_timer(self, duration):
+        """重置LED关闭定时器"""
+        # 取消现有定时器
+        if self.led_timer is not None:
+            self.led_timer.cancel()
+        
+        # 创建新定时器
+        self.led_timer = threading.Timer(duration, self._turn_off_led)
+        self.led_timer.daemon = True
+        self.led_timer.start()
+    
+    def _turn_off_led(self):
+        """定时器回调：关闭LED"""
+        with self.led_timer_lock:
+            if self.led_state == 1:
+                elapsed_time = time.time() - self.led_start_time
+                if self.led_control_func(0):
+                    self.led_state = 0
+                    logger.info(f"LED关闭成功，总计点亮{elapsed_time*1000:.1f}ms")
+                else:
+                    logger.error("LED关闭失败")
+            
+            # 清理定时器
+            self.led_timer = None
+    
+    def immediate_off(self):
+        """立即关闭LED（用于程序退出等情况）"""
+        with self.led_timer_lock:
+            if self.led_timer is not None:
+                self.led_timer.cancel()
+                self.led_timer = None
+            
+            if self.led_state == 1:
+                self.led_control_func(0)
+                self.led_state = 0
+                logger.info("LED立即关闭")
+    
+    def get_led_state(self):
+        """获取LED状态"""
+        with self.led_timer_lock:
+            return self.led_state
+
+class CameraMonitor:
+    def __init__(self):
+        #id
+        # ------- 2 =============
+        #self.camera = GStreamerCamera(camera_id=1)
+        self.cameras = {
+            0: GStreamerCamera(camera_id=0),
+            1: GStreamerCamera(camera_id=1),
+            2: GStreamerCamera(camera_id=2),
+        }
+        # self.last_gpio_state = None
+        self.last_gpio_state = {
+            0: 0,
+            1: 0,
+            2: 0,
+        }
+        # ------- 2 =============
+        self.running = False
+        self.upload_manager = AsyncUploadManager(max_workers=Config.MAX_UPLOAD_WORKERS)
+        
+        # 初始化LED定时器管理器
+        self.led_manager = LedTimerManager(self.control_led)
+        
+        # 状态管理
+        self.trigger_lock = threading.Lock()
+        self.last_trigger_time = 0
+        self.min_trigger_interval = 0.05  # 最小触发间隔50ms，防止过于频繁
+        
+        # 拍照队列管理
+        self.capture_queue = []
+        self.capture_queue_lock = threading.Lock()
+        self.capture_processing = False
+        self.last_capture_time = 0
+        
+    def stop_sdkqmmfserver(self):
+        """停止sdkqmmfserver服务"""
+        try:
+            logger.info("停止sdkqmmfserver服务...")
+            result = subprocess.run(
+                ["systemctl", "stop", "sdkqmmfserver"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                logger.info("sdkqmmfserver服务已停止")
+            else:
+                logger.warning("停止sdkqmmfserver服务失败: %s", result.stderr)
+        except Exception as e:
+            logger.warning("停止sdkqmmfserver服务异常: %s", e)
+    
+    def create_image_directory(self):
+        """创建图片保存目录"""
+        try:
+            os.makedirs(Config.IMAGE_DIR, mode=0o755, exist_ok=True)
+            logger.info("图片目录创建成功: %s", Config.IMAGE_DIR)
+            
+            if os.access(Config.IMAGE_DIR, os.W_OK):
+                logger.info("图片目录可写")
+                return True
+            else:
+                logger.error("图片目录不可写，请检查权限")
+                return False
+                
+        except Exception as e:
+            logger.error("创建图片目录失败: %s", e)
+            return False
+    
+    def check_gstreamer_available(self):
+        """检查GStreamer是否可用"""
+        try:
+            result = subprocess.run(
+                ["which", "gst-launch-1.0"],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                logger.info("GStreamer找到: %s", result.stdout.strip())
+                return True
+            else:
+                logger.error("GStreamer未找到")
+                return False
+        except Exception as e:
+            logger.error("检查GStreamer失败: %s", e)
+            return False
+    
+    def control_led(self, brightness):
+        """控制LED亮度"""
+        try:
+            command = f"echo 'aidlux' | sudo -S echo {brightness} > {Config.LED_BRIGHTNESS_PATH}"
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode == 0:
+                logger.debug("LED控制成功: brightness=%d", brightness)
+                return True
+            else:
+                logger.error("LED控制失败: brightness=%d, 错误: %s", brightness, result.stderr)
+                return False
+                
+        except subprocess.TimeoutExpired:
+            logger.error("LED控制超时")
+            return False
+        except Exception as e:
+            logger.error("LED控制异常: %s", e)
+            return False
+    
+    def get_current_time_with_ms(self):
+        """获取当前时间，包含毫秒"""
+        now = datetime.now()
+        return now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    
+    def save_image(self, frame, filename):
+        """保存图像到文件"""
+        try:
+            filepath = os.path.join(Config.IMAGE_DIR, filename)
+            cv2.imwrite(filepath, frame)
+            logger.info("图片保存成功: %s", filepath)
+            return filepath
+        except Exception as e:
+            logger.error("保存图片失败: %s", e)
+            return None
+    
+    # def handle_gpio_trigger(self):
+    #     """处理GPIO信号触发"""
+    #     try:
+    #         value_file = os.path.join(Config.GPIO_DIR, 'value')
+    #         with open(value_file, 'r') as f:
+    #             value = f.read().strip()
+    #         current_state = int(value)
+    #     except Exception as e:
+    #         logger.error("读取GPIO失败: %s", e)
+    #         return
+    #         # current_time = int(time.time())
+    #         # # 每5秒切换为1，其余时间为0
+    #         # if current_time % 5 == 0:
+    #         #     current_state = 1
+    #         # else:
+    #         #     current_state = 0
+    #     # ---------- 2 ==============
+    #     if current_state in (1, 2):
+    #         cam_id = current_state
+    #         # ---------- 2 ==============
+    #         # 检测状态从0到1的变化
+    #         if self.last_gpio_state == 0:
+    #             # 检查触发间隔，防止过于频繁
+    #             current_time = time.time()
+    #             with self.trigger_lock:
+    #                 if current_time - self.last_trigger_time < self.min_trigger_interval:
+    #                     logger.debug("触发过于频繁，跳过")
+    #                     return
+    #                 self.last_trigger_time = current_time
+    #
+    #             # 在新的线程中处理触发事件，避免阻塞GPIO监控
+    #             trigger_thread = threading.Thread(
+    #                 target=self._handle_trigger_event,
+    #                 # ---------- 2 ==============
+    #                 args=(cam_id,),
+    #                 # ---------- 2 ==============
+    #                 name=f"TriggerThread_cam{cam_id}"
+    #             )
+    #             trigger_thread.daemon = True
+    #             trigger_thread.start()
+    #             logger.debug("已启动触发处理线程")
+    #
+    #         self.last_gpio_state = current_state
+
+    def handle_gpio_trigger(self):
+        """处理多个GPIO的上升沿触发"""
+        for cam_id, gpio_path in Config.GPIO_MAP.items():
+            try:
+                with open(gpio_path, "r") as f:
+                    value = int(f.read().strip())
+            except Exception as e:
+                logger.error(f"读取GPIO失败 cam{cam_id}: {e}")
+                continue
+
+            last_value = self.last_gpio_state.get(cam_id, 0)
+
+            # 检测 0 -> 1 上升沿
+            if last_value == 0 and value == 1:
+                current_time = time.time()
+                with self.trigger_lock:
+                    if current_time - self.last_trigger_time < self.min_trigger_interval:
+                        logger.debug("触发过于频繁，跳过")
+                        continue
+                    self.last_trigger_time = current_time
+
+                logger.info(f"GPIO 上升沿触发 -> 摄像头 {cam_id}")
+
+                trigger_thread = threading.Thread(
+                    target=self._handle_trigger_event,
+                    args=(cam_id,),
+                    name=f"TriggerThread_cam{cam_id}",
+                    daemon=True
+                )
+                trigger_thread.start()
+
+            self.last_gpio_state[cam_id] = value
+
+    def _handle_trigger_event(self,cam_id):
+        """处理单个触发事件"""
+        trigger_time = self.get_current_time_with_ms()
+        # ---------- 2 ==============
+        logger.info(f"=== GPIO触发 -> 摄像头{cam_id} ===")
+        # ---------- 2 ==============
+        logger.info("触发时间: %s", trigger_time)
+        logger.info("信号变化: 0 -> 1")
+        
+        try:
+            # 1. 控制LED点亮并设置定时器
+            led_state = self.led_manager.get_led_state()
+            
+            if led_state == 0:
+                # LED未点亮，需要等待500ms再拍照
+                logger.info("LED未点亮，点亮LED并等待500ms后拍照...")
+                if self.led_manager.turn_on_with_timer(Config.LED_ON_DURATION):
+                    # 等待500ms后拍照
+                    logger.info("等待500ms后拍照...")
+                    time.sleep(Config.LED_ON_DURATION)
+                    
+                    # 执行拍照
+                    # ---------- 2 ==============
+                    self._execute_capture_and_upload(cam_id)
+                    # ---------- 2 ==============
+                else:
+                    logger.error("LED点亮失败，跳过本次触发")
+            else:
+                # LED已点亮，取消现有定时器，立即拍照，然后重置定时器
+                logger.info("LED已点亮，立即拍照并重置定时器...")
+                
+                # 立即拍照
+                self._execute_capture_and_upload(cam_id)
+                
+                # 重置LED定时器（500ms后关闭）
+                self.led_manager.turn_on_with_timer(Config.LED_ON_DURATION)
+                
+        except Exception as e:
+            logger.error("触发处理过程中出现异常: %s", e)
+    
+    def _execute_capture_and_upload(self, cam_id):
+        # ---------- 2 ==============
+        camera = self.cameras.get(cam_id)
+        if camera is None:
+            logger.error(f"无效摄像头ID: {cam_id}")
+            return
+        # ---------- 2 ==============
+        """执行拍照和上传"""
+        # 1. 拍照（从GStreamer流中捕获一帧）
+        logger.info("开始拍照...")
+        frame = camera.capture_image()
+        # ---------- 2 ==============
+        if frame is None:
+            logger.warning(f"摄像头{cam_id} 未捕获到图像")
+            return
+        # ---------- 2 ==============
+
+        # 生成唯一的文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        filename = f"camera{cam_id}-snapshot-{timestamp}.jpg"
+
+        # 2. 保存图片
+        image_path = self.save_image(frame, filename)
+        # 3. 异步上传
+        if image_path:
+            self._async_upload_with_callback(image_path)
+        else:
+            logger.warning("图片保存失败，无法上传")
+
+
+    
+    def _async_upload_with_callback(self, image_path):
+        """异步上传图片，带有回调处理"""
+        def upload_complete_callback(result, task_id):
+            """上传完成回调"""
+            if result.get("success", False):
+                logger.info(f"异步上传成功: {task_id}")
+            else:
+                logger.warning(f"异步上传失败: {task_id}, 原因: {result.get('message', '未知')}")
+            
+            # 上传成功后删除图片，防止堆积
+            try:
+                if os.path.exists(image_path):
+                    os.remove(image_path)
+                    logger.info("临时图片已删除: %s", image_path)
+            except Exception as e:
+                logger.warning("删除临时图片失败: %s", e)
+        
+        # 提交异步上传任务
+        success = self.upload_manager.upload_image_async(
+            image_path, 
+            callback=upload_complete_callback
+        )
+        
+        if success:
+            logger.info("异步上传任务已提交，继续处理后续GPIO信号...")
+        else:
+            logger.warning("上传任务已存在或提交失败，跳过重复上传")
+    
+    def cleanup_old_images(self, cam_id):
+        """清理过期图片"""
+        try:
+            pattern = os.path.join(Config.IMAGE_DIR, f"camera*-snapshot-*.jpg")
+            image_files = glob.glob(pattern)
+            current_time = time.time()
+            deleted_count = 0
+            
+            for image_file in image_files:
+                file_age = current_time - os.path.getmtime(image_file)
+                if file_age > Config.FILE_MAX_AGE:
+                    try:
+                        os.remove(image_file)
+                        deleted_count += 1
+                    except Exception:
+                        pass
+            
+            if deleted_count > 0:
+                logger.info("清理完成，删除了 %d 个过期图片", deleted_count)
+                
+        except Exception as e:
+            logger.error("清理图片过程异常: %s", e)
+    
+    # def gpio_monitor_loop(self):
+    #     """GPIO信号监控循环"""
+    #     logger.info("启动GPIO信号监控...")
+    #     logger.info("GPIO检测间隔: %.3f秒", Config.GPIO_CHECK_INTERVAL)
+    #
+    #     # 初始化GPIO状态
+    #     try:
+    #         value_file = os.path.join(Config.GPIO_DIR, 'value')
+    #         with open(value_file, 'r') as f:
+    #             value = f.read().strip()
+    #         self.last_gpio_state = int(value)
+    #         logger.info("初始GPIO状态: %s", self.last_gpio_state)
+    #     except Exception as e:
+    #         logger.error("读取初始GPIO状态失败: %s", e)
+    #         self.last_gpio_state = 0
+    #
+    #     check_count = 0
+    #     while self.running:
+    #         try:
+    #             self.handle_gpio_trigger()
+    #             time.sleep(Config.GPIO_CHECK_INTERVAL)
+    #
+    #             check_count += 1
+    #             if check_count % 1000 == 0:
+    #                 logger.debug("GPIO监控运行中，已检查 %d 次", check_count)
+    #
+    #         except Exception as e:
+    #             logger.error("GPIO监控循环异常: %s", e)
+    #             time.sleep(1)
+    # ------------ 2 =============
+    def gpio_monitor_loop(self):
+        """GPIO信号监控循环（多GPIO，上升沿触发）"""
+        logger.info("启动GPIO信号监控...")
+        logger.info("GPIO检测间隔: %.3f秒", Config.GPIO_CHECK_INTERVAL)
+
+        check_count = 0
+
+        while self.running:
+            try:
+                self.handle_gpio_trigger()
+                time.sleep(Config.GPIO_CHECK_INTERVAL)
+
+                check_count += 1
+                if check_count % 1000 == 0:
+                    logger.debug("GPIO监控运行中，已检查 %d 次", check_count)
+
+            except Exception as e:
+                logger.error("GPIO监控循环异常: %s", e)
+                time.sleep(1)
+
+    # ------------ 2 =============
+    def cleanup_loop(self):
+        """清理循环"""
+        logger.info("启动图片清理循环，间隔: %d秒", Config.CLEANUP_INTERVAL)
+        
+        while self.running:
+            try:
+                self.cleanup_old_images()
+                for _ in range(Config.CLEANUP_INTERVAL):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+            except Exception as e:
+                logger.error("清理循环异常: %s", e)
+                time.sleep(1)
+    
+    def start(self):
+        """启动监控"""
+        logger.info("启动相机监控系统（GStreamer流方式）...")
+        self.running = True
+        
+        # 1. 创建图片目录
+        if not self.create_image_directory():
+            logger.error("无法创建图片目录，退出")
+            return False
+        
+        # 2. 启动GStreamer相机
+        #-------- 2 ---------------------
+        logger.info("启动GStreamer相机...")
+        for cam_id, cam in self.cameras.items():
+            logger.info(f"启动摄像头 {cam_id} ...")
+            if not cam.start():
+                logger.error(f"摄像头 {cam_id} 启动失败")
+                return False
+
+        # if not self.camera.start():
+        #     logger.error("无法启动GStreamer相机，退出")
+        #     return False
+        
+        # 等待GStreamer初始化
+        time.sleep(2)
+        logger.info("GStreamer相机初始化完成")
+        
+        # 3. 启动GPIO监控线程
+        gpio_thread = threading.Thread(target=self.gpio_monitor_loop)
+        gpio_thread.daemon = True
+        gpio_thread.start()
+        
+        # 4. 启动清理线程
+        cleanup_thread = threading.Thread(target=self.cleanup_loop)
+        cleanup_thread.daemon = True
+        cleanup_thread.start()
+        
+        logger.info("相机监控系统启动完成")
+        logger.info("图片保存目录: %s", Config.IMAGE_DIR)
+        # logger.info("GPIO监控路径: %s", Config.GPIO_DIR)
+        # -------- 2 ===============
+        logger.info("GPIO 监控映射:")
+        for cam_id, path in Config.GPIO_MAP.items():
+            logger.info(f"  camera {cam_id} -> {path}")
+        # -------- 2 ===============
+        logger.info("LED控制文件: %s", Config.LED_BRIGHTNESS_PATH)
+        logger.info("上传服务器: %s", Config.UPLOAD_URL)
+        logger.info("GPIO检测间隔: %.3f秒", Config.GPIO_CHECK_INTERVAL)
+        logger.info("LED点亮持续时间: %.1fms", Config.LED_ON_DURATION * 1000)
+        
+        # 创建GLib主循环
+        self.loop = GLib.MainLoop()
+        
+        return True
+    
+    def stop(self):
+        """停止监控"""
+        logger.info("停止相机监控系统...")
+        self.running = False
+        
+        # 停止GStreamer相机
+        # -------- 2 ================
+        for cam in self.cameras.values():
+            cam.stop()
+        # -------- 2 ================
+        # 关闭上传管理器
+        self.upload_manager.shutdown()
+        
+        # 确保LED关闭
+        self.led_manager.immediate_off()
+        
+        logger.info("相机监控系统已停止")
+    
+    def run_main_loop(self):
+        """运行主循环"""
+        try:
+            self.loop.run()
+        except KeyboardInterrupt:
+            logger.info("收到中断信号，正在退出...")
+            self.stop()
+        except Exception as e:
+            logger.error("主循环异常: %s", e)
+            self.stop()
+
+def main():
+    monitor = CameraMonitor()
+    
+    try:
+        if monitor.start():
+            monitor.run_main_loop()
+            
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，正在退出...")
+    except Exception as e:
+        logger.error("主程序异常: %s", e)
+    finally:
+        monitor.stop()
+
+if __name__ == "__main__":
+    main()
